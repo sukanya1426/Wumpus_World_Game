@@ -1,0 +1,275 @@
+function inList(lst, r, c) {
+  if (!lst || !Array.isArray(lst)) return false;
+  return lst.some(([rr, cc]) => rr === r && cc === c);
+}
+
+function getAdjacent(row, col, size) {
+  return [
+    [row - 1, col],
+    [row + 1, col],
+    [row, col - 1],
+    [row, col + 1],
+  ].filter(([r, c]) => r >= 0 && r < size && c >= 0 && c < size);
+}
+
+// First Order Logic rules:
+// 1. ∀x,y: Breeze(x,y) ⇒ (∃i,j: Adjacent(x,y,i,j) ∧ Pit(i,j))
+// 2. ∀x,y: Stench(x,y) ⇒ (∃i,j: Adjacent(x,y,i,j) ∧ Wumpus(i,j))
+// 3. ∀x,y: ¬Breeze(x,y) ⇒ (∀i,j: Adjacent(x,y,i,j) ⇒ ¬Pit(i,j))
+// 4. ∀x,y: ¬Stench(x,y) ⇒ (∀i,j: Adjacent(x,y,i,j) ⇒ ¬Wumpus(i,j))
+
+function calculateRisk(r, c, possiblePits, possibleWumpus, moveHistory, safe) {
+  let risk = 0;
+
+  // Base risk for possible dangers
+  if (inList(possiblePits, r, c)) risk += 50;
+  if (inList(possibleWumpus, r, c)) risk += 100;
+
+  // Reduce risk for known safe cells
+  if (inList(safe, r, c)) risk -= 30;
+
+  // Increase risk for recently visited cells to avoid loops
+  const recentVisits = moveHistory.slice(-5).filter(([mr, mc]) => mr === r && mc === c).length;
+  risk += recentVisits * 20;  // Penalize recent revisits more heavily
+
+  // Increase risk based on total visit count to encourage exploration
+  const totalVisits = moveHistory.filter(([mr, mc]) => mr === r && mc === c).length;
+  risk += totalVisits * 5;
+
+  return risk;
+}
+
+function findSafestPath(current, target, size, safe, possiblePits, possibleWumpus, visited) {
+  const [startRow, startCol] = current;
+  const [targetRow, targetCol] = target;
+  const queue = [[[startRow, startCol]]];
+  const seen = new Set([`${startRow},${startCol}`]);
+
+  while (queue.length > 0) {
+    const path = queue.shift();
+    const [row, col] = path[path.length - 1];
+
+    if (row === targetRow && col === targetCol) {
+      return path;
+    }
+
+    const neighbors = getAdjacent(row, col, size);
+    for (const [r, c] of neighbors) {
+      const key = `${r},${c}`;
+      if (!seen.has(key) && inList(safe, r, c) &&
+        !inList(possiblePits, r, c) && !inList(possibleWumpus, r, c)) {
+        seen.add(key);
+        queue.push([...path, [r, c]]);
+      }
+    }
+  }
+  return null;
+}
+
+function inferSafeLocations(loc, percepts, size, visited) {
+  const [x, y] = loc;
+  const adjacent = getAdjacent(x, y, size);
+
+  // If no breeze and no stench, all adjacent cells are safe
+  if (!percepts.breeze && !percepts.stench) {
+    // Prioritize unvisited cells
+    return adjacent.sort((a, b) => {
+      const [ar, ac] = a;
+      const [br, bc] = b;
+      const aVisited = inList(visited, ar, ac) ? 1 : 0;
+      const bVisited = inList(visited, br, bc) ? 1 : 0;
+      return bVisited - aVisited;
+    });
+  }
+  return [];
+}
+
+function inferDangerousLocations(loc, percepts, size, type) {
+  const [x, y] = loc;
+  const adjacent = getAdjacent(x, y, size);
+
+  if ((type === 'pit' && percepts.breeze) || (type === 'wumpus' && percepts.stench)) {
+    // Sort adjacent cells by distance from current location
+    return adjacent.sort((a, b) => {
+      return Math.abs(a[0] - x) + Math.abs(a[1] - y) -
+        (Math.abs(b[0] - x) + Math.abs(b[1] - y));
+    });
+  }
+  return [];
+}
+
+export function agentReasoning(agentPos, visited, kb = null, percepts, env, wumpusAlive = []) {
+  // Ensure kb is initialized with default values if null/undefined
+  const defaultKb = {
+    safe: [[0, 0]],
+    possiblePits: [],
+    possibleWumpus: [],
+    visited: [[0, 0]],
+    reasoning: [],
+    arrows: 1,
+    moveHistory: []
+  };
+  kb = kb || defaultKb;
+
+  const size = env.length;
+  let safe = Array.isArray(kb.safe) ? kb.safe.slice() : defaultKb.safe.slice();
+  let possiblePits = Array.isArray(kb.possiblePits) ? kb.possiblePits.slice() : defaultKb.possiblePits.slice();
+  let possibleWumpus = Array.isArray(kb.possibleWumpus) ? kb.possibleWumpus.slice() : defaultKb.possibleWumpus.slice();
+  let visitedList = Array.isArray(kb.visited) ? kb.visited.slice() : defaultKb.visited.slice();
+  let reasoning = Array.isArray(kb.reasoning) ? kb.reasoning.slice() : defaultKb.reasoning.slice();
+  let arrows = typeof kb.arrows === "number" ? kb.arrows : defaultKb.arrows;
+  let moveHistory = Array.isArray(kb.moveHistory) ? kb.moveHistory.slice() : defaultKb.moveHistory.slice();
+  const { row, col } = agentPos;
+
+  // Update visited and safe lists
+  if (!inList(visitedList, row, col)) visitedList.push([row, col]);
+  if (!inList(safe, row, col)) {
+    safe.push([row, col]);
+    reasoning.push(`Agent at (${row},${col}) is safe (FOL: Visited(${row},${col}) ⇒ Safe(${row},${col}))`);
+  }
+
+  const adj = getAdjacent(row, col, size);
+
+  // Apply FOL rules for breezes
+  // Rule: Breeze(x,y) ⇒ ∃(i,j) Adjacent(x,y,i,j) ∧ Pit(i,j)
+  if (percepts.breeze) {
+    const newPossiblePits = inferDangerousLocations([row, col], percepts, size, 'pit');
+    newPossiblePits.forEach(([r, c]) => {
+      if (!inList(safe, r, c) && !inList(possiblePits, r, c)) {
+        possiblePits.push([r, c]);
+        reasoning.push(`FOL: Breeze(${row},${col}) ∧ Adjacent(${row},${col},${r},${c}) ⇒ PossiblePit(${r},${c})`);
+      }
+    });
+  } else {
+    // Rule: ¬Breeze(x,y) ⇒ ∀(i,j) Adjacent(x,y,i,j) ⇒ ¬Pit(i,j)
+    const safeCells = inferSafeLocations([row, col], percepts, size);
+    safeCells.forEach(([r, c]) => {
+      if (!inList(safe, r, c)) {
+        safe.push([r, c]);
+        reasoning.push(`FOL: ¬Breeze(${row},${col}) ∧ Adjacent(${row},${col},${r},${c}) ⇒ ¬Pit(${r},${c})`);
+        possiblePits = possiblePits.filter(([rr, cc]) => !(rr === r && cc === c));
+      }
+    });
+  }
+
+  // Apply FOL rules for stenches
+  // Enhanced Wumpus detection using multiple stench percepts
+  // Initialize wumpusConfidence map for tracking Wumpus location probabilities
+  const wumpusConfidence = {};
+
+  // Apply FOL rules for stenches with confidence tracking
+  if (percepts.stench && wumpusAlive.length > 0) {
+    const newPossibleWumpus = inferDangerousLocations([row, col], percepts, size, 'wumpus');
+
+    // Get all cells with stench for confidence calculation
+    const stenchPositions = visitedList.filter(([r, c]) =>
+      env[r][c].stench &&
+      wumpusAlive.some(([wr, wc]) => Math.abs(wr - r) <= 1 && Math.abs(wc - c) <= 1)
+    );
+
+    // Process each possible Wumpus location
+    newPossibleWumpus.forEach(([r, c]) => {
+      if (!inList(safe, r, c) && !inList(possibleWumpus, r, c)) {
+        // Count how many stench cells are adjacent to this location
+        const adjacentStenchCount = stenchPositions.filter(([sr, sc]) =>
+          Math.abs(sr - r) <= 1 && Math.abs(sc - c) <= 1
+        ).length;
+
+        possibleWumpus.push([r, c]);
+
+        // Calculate confidence based on number of adjacent stenches
+        if (adjacentStenchCount >= 2) {
+          wumpusConfidence[`${r},${c}`] = 0.9;  // High confidence with multiple stenches
+          reasoning.push(`FOL: Multiple stenches (${adjacentStenchCount}) strongly indicate Wumpus at (${r},${c})`);
+        } else {
+          wumpusConfidence[`${r},${c}`] = 0.5;  // Lower confidence with single stench
+          reasoning.push(`FOL: Stench(${row},${col}) ∧ Adjacent(${row},${col},${r},${c}) ⇒ PossibleWumpus(${r},${c})`);
+        }
+      }
+    });
+  } else {
+    // No stench means adjacent cells are safe from Wumpus
+    adj.forEach(([r, c]) => {
+      if (!inList(safe, r, c)) {
+        safe.push([r, c]);
+        wumpusConfidence[`${r},${c}`] = 0;  // Zero confidence of Wumpus
+        reasoning.push(`No stench at (${row},${col}) ⇒ (${r},${c}) is safe`);
+        possibleWumpus = possibleWumpus.filter(([rr, cc]) => !(rr === r && cc === c));
+      }
+    });
+  }
+
+  // Enhanced shooting logic with more aggressive Wumpus detection
+  // Immediate shooting response when stench is detected
+  let shootAction = null;
+  if (wumpusAlive.length > 0 && arrows > 0 && percepts.stench) {
+    const adjacentCells = getAdjacent(row, col, size);
+    
+    // If we smell a stench, immediately check adjacent cells for Wumpus
+    const wumpusCandidates = adjacentCells.filter(([r, c]) => {
+      // Check if this cell is a good candidate for shooting:
+      // 1. Should be unvisited (we don't shoot at cells we've been to)
+      // 2. Should not be marked as safe
+      // 3. OR should be directly detected as containing a Wumpus
+      return (!inList(visited, r, c) && !inList(safe, r, c)) || env[r][c].wumpus;
+    });
+
+    // If we have candidates, choose one to shoot at
+    if (wumpusCandidates.length > 0) {
+      // Prefer shooting at a cell that's directly detected as containing a Wumpus
+      const definiteWumpus = wumpusCandidates.find(([r, c]) => env[r][c].wumpus);
+      const targetCell = definiteWumpus || wumpusCandidates[0];
+      const [targetRow, targetCol] = targetCell;
+
+      const directions = [
+        ["up", row - 1 === targetRow && col === targetCol],
+        ["down", row + 1 === targetRow && col === targetCol],
+        ["left", row === targetRow && col - 1 === targetCol],
+        ["right", row === targetRow && col + 1 === targetCol]
+      ];
+
+      for (const [dir, isTarget] of directions) {
+        if (isTarget) {
+          shootAction = { type: "shoot", direction: dir, target: [targetRow, targetCol] };
+          reasoning.push(
+            `Detected stench - Immediately shooting ${dir} at (${targetRow},${targetCol})` +
+            (env[targetRow][targetCol].wumpus ? " [Confirmed Wumpus location]" : "")
+          );
+          arrows -= 1;
+          break;
+        }
+      }
+    }
+  }
+
+  // Movement logic using FOL
+  let nextMove = null;
+  const directions = [
+    ["up", [row - 1, col]],
+    ["down", [row + 1, col]],
+    ["left", [row, col - 1]],
+    ["right", [row, col + 1]],
+  ];
+
+  if (!shootAction) {
+    // First try to find a safe path to an unvisited cell
+    let bestPath = null;
+    let targetCell = null;
+
+    // Look for unvisited safe cells and find paths to them
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        if (!inList(visitedList, r, c) &&
+          inList(safe, r, c) &&
+          !inList(possiblePits, r, c) &&
+          !inList(possibleWumpus, r, c)) {
+          const path = findSafestPath([row, col], [r, c], size, safe, possiblePits, possibleWumpus, visited);
+          if (path && path.length > 1) {
+            bestPath = path;
+            // eslint-disable-next-line no-unused-vars
+            targetCell = [r, c];  // Kept for debugging purposes
+            break;
+          }
+        }
+      }
+      if
